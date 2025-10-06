@@ -1,4 +1,4 @@
-﻿import os, json
+﻿import os
 from fastapi import FastAPI, HTTPException
 import httpx
 import psycopg
@@ -37,7 +37,7 @@ def ingest_sports(dry_run: int = 1):
     except Exception as e:
         raise HTTPException(502, f"Odds API error: {e}")
 
-    # record an audit entry to confirm DB write works
+    # Optional DB write (audit)
     try:
         if dry_run == 0:
             with psycopg.connect(DB_URL) as conn:
