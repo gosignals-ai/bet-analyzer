@@ -1,0 +1,5 @@
+fastapi>=0.110,<0.120
+uvicorn[standard]>=0.23,<0.32
+psycopg[binary]>=3.2.0,<3.3
+python-dotenv>=1.0,<2.0
+pydantic>=2.7,<3.0
