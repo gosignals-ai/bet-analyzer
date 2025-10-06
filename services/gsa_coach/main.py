@@ -1,4 +1,4 @@
-﻿import os
+import os
 from fastapi import FastAPI, HTTPException
 import psycopg, httpx
 
