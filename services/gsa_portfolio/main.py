@@ -1,4 +1,5 @@
-﻿import os
+from services.portfolio.app.admin import router as admin_router
+import os
 from typing import List
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -9,7 +10,7 @@ DB_URL = os.getenv("DATABASE_URL")
 
 app = FastAPI(title="GoSignals Portfolio", version="0.1.0")
 
-class PortfolioIn(BaseModel):
+`r`napp.include_router(admin_router)`r`nclass PortfolioIn(BaseModel):
     name: str = Field(..., min_length=1, max_length=64)
     balance: float = 0.0
     currency: str = "USD"
