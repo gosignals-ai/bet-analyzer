@@ -50,3 +50,12 @@ def ingest_sports(dry_run: int = 1):
         return {"fetched": len(data), "dry_run": bool(dry_run)}
     except Exception as e:
         raise HTTPException(500, f"DB write error: {e}")
+# --- auto: attach normalize router ---
+try:
+    from services.gsa_ingestor.normalize import router as normalize_router
+    app.include_router(normalize_router)
+    print("[ingestor] normalize router attached")
+except Exception as e:
+    import sys
+    print(f"[ingestor] normalize attach failed: {e}", file=sys.stderr)
+# --- end auto ---
