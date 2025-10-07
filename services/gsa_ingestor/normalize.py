@@ -1,6 +1,6 @@
 import os
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from services.gsa_portfolio.db import get_pool  # shared async pool shim
+from services.gsa_portfolio.db import get_pool  # reuse async pool shim
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
@@ -53,8 +53,8 @@ async def normalize_from_raw(dry_run: int = Query(1, ge=0, le=1), ok: bool = Dep
                   where r.game_id is not null and r.market_key is not null and r.book_key is not null and r.last_update is not null
                   group by 1,2,3
                 )
-                insert into odds_norm.markets(game_uid, market_key, book_key, market_ref, last_update
-                ) select a.game_uid, a.market_key, a.book_key, null, a.last_update
+                insert into odds_norm.markets(game_uid, market_key, book_key, market_ref, last_update)
+                select a.game_uid, a.market_key, a.book_key, null, a.last_update
                 from agg a
                 on conflict (game_uid, market_key, book_key) do update
                   set last_update = greatest(excluded.last_update, odds_norm.markets.last_update),
