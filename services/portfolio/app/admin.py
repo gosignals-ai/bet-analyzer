@@ -21,7 +21,7 @@ def _auth(
     """
     expected = (os.environ.get("SHARED_TASK_TOKEN") or "").strip().strip('"').strip("'")
     if not expected:
-        return True  # no token configured → open
+        return True  # no token configured â†’ open
 
     presented = None
     if authorization:
@@ -61,8 +61,8 @@ async def run_retention(dry_run: bool = Query(False), ok: bool = Depends(_auth))
 @router.post("/normalize")
 async def normalize_from_raw(dry_run: bool = Query(True), ok: bool = Depends(_auth)):
     """
-    Normalize public.odds_raw → odds_norm.games/markets/odds.
-    dry_run=true → no DB writes.
+    Normalize public.odds_raw â†’ odds_norm.games/markets/odds.
+    dry_run=true â†’ no DB writes.
     """
     if dry_run:
         return {"normalized": {"games": 0, "markets": 0, "odds_inserts": 0}, "dry_run": True}
