@@ -1,0 +1,92 @@
+openapi: 3.1.0
+info:
+  title: GoSignals Gateway
+  version: "1.0.0"
+servers:
+  - url: https://gsa-api.gosignals-ai.workers.dev
+paths:
+  /core/metrics:
+    get:
+      operationId: coreMetrics
+      summary: Get Core metrics (row counts)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  moneyline_rows:
+                    type: integer
+  /core/latest-lines:
+    get:
+      operationId: coreLatestLines
+      summary: Latest moneylines per game (best prices)
+      parameters:
+        - name: sport
+          in: query
+          required: false
+          schema:
+            type: string
+            example: americanfootball_nfl
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    sport_key: { type: string }
+                    game_id: { type: string }
+                    away_team: { type: string, nullable: true }
+                    home_team: { type: string, nullable: true }
+                    commence_time_utc: { type: string, format: date-time, nullable: true }
+                    away_best_price: { type: integer, nullable: true }
+                    away_book: { type: string, nullable: true }
+                    home_best_price: { type: integer, nullable: true }
+                    home_book: { type: string, nullable: true }
+  /coach/summary:
+    get:
+      operationId: coachSummary
+      summary: Human-readable summary of available games
+      parameters:
+        - name: league
+          in: query
+          required: false
+          schema:
+            type: string
+            default: americanfootball_nfl
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  summary: { type: string }
+                  samples:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        matchup: { type: string }
+                        away_best: { type: string }
+                        home_best: { type: string }
+                        kick: { type: string }
