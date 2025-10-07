@@ -1,10 +1,5 @@
 fastapi
 uvicorn[standard]
-httpx
-pydantic>=2
-sqlalchemy[asyncio]
 asyncpg
-psycopg[binary]
 python-dotenv
-loguru
-pyyaml
+pydantic
