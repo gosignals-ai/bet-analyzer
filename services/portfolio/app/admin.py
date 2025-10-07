@@ -126,4 +126,9 @@ async def normalize_from_raw(dry_run: bool = Query(True), ok: bool = Depends(_au
             """)
             o = len(await cur.fetchall())
 
-    return {"normalized": {"games": g, "markets": m, "odds_inserts": o}, "dry_run": False}
+    return {"normalized": {"games": g, "markets": m, "odds_inserts": o}, "dry_run": False}@router.get("/__debug_token")
+async def debug_token():
+    import os, hashlib
+    t = (os.environ.get("SHARED_TASK_TOKEN") or "").strip().strip('"').strip("'")
+    h = hashlib.sha256(t.encode()).hexdigest()[:8] if t else "MISSING"
+    return {"expected_sha8": h, "len_expected": len(t)}
