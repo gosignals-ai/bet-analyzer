@@ -1,6 +1,6 @@
 import os
 from fastapi import APIRouter, Depends, Header, HTTPException
-from .db import get_pool  # existing psycopg pool helper
+from services.gsa_portfolio.db import get_pool  # <-- correct absolute import
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -11,6 +11,10 @@ def _auth(authorization: str | None = Header(None)):
     if authorization.split(" ", 1)[1] != token:
         raise HTTPException(status_code=403, detail="forbidden")
     return True
+
+@router.get("/__ping")
+async def ping(ok: bool = Depends(_auth)):
+    return {"ok": True, "svc": "portfolio-admin"}
 
 @router.post("/retention")
 async def run_retention(dry_run: bool = False, ok: bool = Depends(_auth)):
