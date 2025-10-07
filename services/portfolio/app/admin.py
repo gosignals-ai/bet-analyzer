@@ -1,14 +1,43 @@
 import os
-from fastapi import APIRouter, Depends, Header, HTTPException
-from services.gsa_portfolio.db import get_pool  # <-- correct absolute import
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+
+# get_pool import (support both layouts)
+try:
+    from .db import get_pool  # typical local helper
+except Exception:
+    from services.gsa_portfolio.db import get_pool  # shim we added
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-def _auth(authorization: str | None = Header(None)):
-    token = os.environ.get("SHARED_TASK_TOKEN")
-    if not token or not authorization or not authorization.startswith("Bearer "):
+def _auth(
+    authorization: str | None = Header(None),
+    x_gsa: str | None = Header(None, alias="x-gsa-token"),
+):
+    """
+    Accepts either:
+      - Authorization: Bearer <token>
+      - x-gsa-token: <token>
+    Trims quotes/whitespace to avoid silent mismatches.
+    """
+    expected = (os.environ.get("SHARED_TASK_TOKEN") or "").strip().strip('"').strip("'")
+    if not expected:
+        return True  # no token configured → open
+
+    presented = None
+    if authorization:
+        low = authorization.lower()
+        if low.startswith("bearer "):
+            presented = authorization[7:]
+        else:
+            presented = authorization
+    if not presented and x_gsa:
+        presented = x_gsa
+
+    if not presented:
         raise HTTPException(status_code=401, detail="unauthorized")
-    if authorization.split(" ", 1)[1] != token:
+
+    presented = presented.strip().strip('"').strip("'")
+    if presented != expected:
         raise HTTPException(status_code=403, detail="forbidden")
     return True
 
@@ -17,24 +46,23 @@ async def ping(ok: bool = Depends(_auth)):
     return {"ok": True, "svc": "portfolio-admin"}
 
 @router.post("/retention")
-async def run_retention(dry_run: bool = False, ok: bool = Depends(_auth)):
+async def run_retention(dry_run: bool = Query(False), ok: bool = Depends(_auth)):
     pool = get_pool()
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             if dry_run:
-                await cur.execute("SELECT * FROM retention.purge_portfolios_395d(p_dry_run := TRUE);")
+                await cur.execute("SELECT * FROM retention.purge_portfolios_395d(p_dry_run := TRUE)")
             else:
-                await cur.execute("SELECT * FROM retention.purge_portfolios_395d(p_batch := 50000, p_hard_cap := 5000000, p_dry_run := FALSE);")
+                await cur.execute("SELECT * FROM retention.purge_portfolios_395d(p_batch := 50000, p_hard_cap := 5000000, p_dry_run := FALSE)")
             row = await cur.fetchone()
-            affected = int(row[0]) if row else 0
+    affected = int(row[0]) if row else 0
     return {"purged": affected, "dry_run": bool(dry_run)}
-from fastapi import Query
 
 @router.post("/normalize")
 async def normalize_from_raw(dry_run: bool = Query(True), ok: bool = Depends(_auth)):
     """
-    Normalize rows from public.odds_raw into odds_norm.games/markets/odds.
-    dry_run=true -> no DB changes.
+    Normalize public.odds_raw → odds_norm.games/markets/odds.
+    dry_run=true → no DB writes.
     """
     if dry_run:
         return {"normalized": {"games": 0, "markets": 0, "odds_inserts": 0}, "dry_run": True}
@@ -42,12 +70,12 @@ async def normalize_from_raw(dry_run: bool = Query(True), ok: bool = Depends(_au
     pool = get_pool()
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
-            # Ensure table exists
+            # Ensure source exists
             await cur.execute("select to_regclass('public.odds_raw')")
             if (await cur.fetchone())[0] is None:
                 return {"error":"odds_raw_not_found","normalized":{"games":0,"markets":0,"odds_inserts":0}}
 
-            # 1) games
+            # games
             await cur.execute("""
                 insert into odds_norm.games(game_uid, sport_key, commence_time, home_team, away_team, status)
                 select distinct r.game_id, r.sport_key, r.commence_time, r.home_team, r.away_team, null
@@ -63,7 +91,7 @@ async def normalize_from_raw(dry_run: bool = Query(True), ok: bool = Depends(_au
             """)
             g = len(await cur.fetchall())
 
-            # 2) markets (latest per trio)
+            # markets
             await cur.execute("""
                 with agg as (
                   select r.game_id as game_uid,
@@ -84,7 +112,7 @@ async def normalize_from_raw(dry_run: bool = Query(True), ok: bool = Depends(_au
             """)
             m = len(await cur.fetchall())
 
-            # 3) odds (time-series; dedup on unique key)
+            # odds
             await cur.execute("""
                 insert into odds_norm.odds(game_uid, market_key, book_key, side, price, point, last_update, observed_at)
                 select r.game_id, r.market_key, r.book_key,
