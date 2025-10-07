@@ -49,11 +49,13 @@ async def run_retention(
 @router.post("/normalize")
 async def normalize_from_raw(
     dry_run: bool = Query(True),
-    limit: Optional[int] = Query(None, description="optional row cap for diagnostics"),
+    limit: Optional[int] = Query(None, description="cap source rows"),
     ok: bool = Depends(_auth),
 ):
     """
-    Normalize public.odds_raw → odds_norm.* with defensive casts.
+    Normalize public.odds_raw (payload JSONB) → odds_norm.games/markets/odds.
+    Expected odds_raw columns: fetched_at (timestamptz), payload (jsonb), payload_hash (text), plus keys like game_id/sport_key.
+    JSON structure (Odds API): payload.bookmakers[*].key, .markets[*].key, .markets[*].last_update, .markets[*].outcomes[*]{name,price,point,last_update}
     """
     if dry_run:
         return {"normalized": {"games": 0, "markets": 0, "odds_inserts": 0}, "dry_run": True}
@@ -61,98 +63,141 @@ async def normalize_from_raw(
     pool = get_pool()
     try:
         async with pool.connection() as conn, conn.cursor() as cur:
-            # Ensure schema exists
+            # Ensure schema exists (idempotent)
             await cur.execute("CREATE SCHEMA IF NOT EXISTS odds_norm")
 
-            # ---------- GAMES ----------
-            games_sql = """
+            # Build limit clause & params
+            limit_clause = " LIMIT %s" if (limit and limit > 0) else ""
+            params = (limit,) if limit_clause else tuple()
+
+            # ---- GAMES ----
+            games_sql = f"""
+                WITH src AS (
+                  SELECT game_id, fetched_at, payload
+                  FROM public.odds_raw
+                  WHERE game_id IS NOT NULL
+                  ORDER BY fetched_at DESC
+                  {limit_clause}
+                )
                 INSERT INTO odds_norm.games (game_uid, sport_key, commence_time, home_team, away_team, status)
-                SELECT DISTINCT r.game_id, r.sport_key, r.commence_time, r.home_team, r.away_team, NULL
-                FROM public.odds_raw r
-                WHERE r.game_id IS NOT NULL
-            """
-            games_params = []
-            if limit and limit > 0:
-                games_sql += " LIMIT %s"
-                games_params.append(limit)
-            games_sql += """
+                SELECT DISTINCT
+                    s.game_id                                             AS game_uid,
+                    s.payload->>'sport_key'                                AS sport_key,
+                    NULLIF(s.payload->>'commence_time','')::timestamptz    AS commence_time,
+                    s.payload->>'home_team'                                AS home_team,
+                    s.payload->>'away_team'                                AS away_team,
+                    NULL                                                   AS status
+                FROM src s
                 ON CONFLICT (game_uid) DO UPDATE SET
-                    sport_key = EXCLUDED.sport_key,
+                    sport_key     = EXCLUDED.sport_key,
                     commence_time = EXCLUDED.commence_time,
-                    home_team = EXCLUDED.home_team,
-                    away_team = EXCLUDED.away_team,
-                    updated_at = now()
+                    home_team     = EXCLUDED.home_team,
+                    away_team     = EXCLUDED.away_team,
+                    updated_at    = now()
                 RETURNING 1
             """
-            await cur.execute(games_sql, tuple(games_params))
+            await cur.execute(games_sql, params)
             g = len(await cur.fetchall())
 
-            # ---------- MARKETS ----------
-            markets_sql = """
-                WITH agg AS (
-                  SELECT r.game_id AS game_uid,
-                         r.market_key,
-                         r.book_key,
-                         MAX(r.last_update) AS last_update
-                  FROM public.odds_raw r
-                  WHERE r.game_id IS NOT NULL
-                        AND r.market_key IS NOT NULL
-                        AND r.book_key IS NOT NULL
-                        AND r.last_update IS NOT NULL
-                  GROUP BY 1,2,3
+            # ---- MARKETS ----
+            markets_sql = f"""
+                WITH src AS (
+                  SELECT game_id, fetched_at, payload
+                  FROM public.odds_raw
+                  WHERE game_id IS NOT NULL
+                  ORDER BY fetched_at DESC
+                  {limit_clause}
+                ),
+                bm AS (
+                  SELECT
+                    s.game_id,
+                    s.fetched_at,
+                    (b->>'key') AS book_key,
+                    (m->>'key') AS market_key,
+                    COALESCE(NULLIF(m->>'last_update','')::timestamptz, s.fetched_at) AS last_update
+                  FROM src s
+                  CROSS JOIN LATERAL jsonb_array_elements(s.payload->'bookmakers') AS b
+                  CROSS JOIN LATERAL jsonb_array_elements(b->'markets')           AS m
+                  WHERE b ? 'key' AND m ? 'key'
                 )
                 INSERT INTO odds_norm.markets (game_uid, market_key, book_key, market_ref, last_update)
-                SELECT a.game_uid, a.market_key, a.book_key, NULL, a.last_update
-                FROM agg a
+                SELECT game_id, market_key, book_key, NULL, last_update
+                FROM bm
                 ON CONFLICT (game_uid, market_key, book_key) DO UPDATE
-                  SET last_update = GREATEST(EXCLUDED.last_update, odds_norm.markets.last_update),
+                  SET last_update = GREATEST(odds_norm.markets.last_update, EXCLUDED.last_update),
                       updated_at = now()
                 RETURNING 1
             """
-            markets_params = []
-            if limit and limit > 0:
-                # apply a LIMIT by wrapping the final SELECT
-                markets_sql = markets_sql.replace("FROM agg a", "FROM agg a ORDER BY a.game_uid, a.market_key, a.book_key LIMIT %s")
-                markets_params.append(limit)
-            await cur.execute(markets_sql, tuple(markets_params))
+            await cur.execute(markets_sql, params)
             m = len(await cur.fetchall())
 
-            # ---------- ODDS ----------
-            odds_sql = """
+            # ---- ODDS ----
+            odds_sql = f"""
+                WITH src AS (
+                  SELECT game_id, fetched_at, payload
+                  FROM public.odds_raw
+                  WHERE game_id IS NOT NULL
+                  ORDER BY fetched_at DESC
+                  {limit_clause}
+                ),
+                bm AS (
+                  SELECT
+                    s.game_id,
+                    s.fetched_at,
+                    (b->>'key') AS book_key,
+                    (m->>'key') AS market_key,
+                    COALESCE(NULLIF(m->>'last_update','')::timestamptz, s.fetched_at) AS market_last_update,
+                    (m->'outcomes') AS outcomes
+                  FROM src s
+                  CROSS JOIN LATERAL jsonb_array_elements(s.payload->'bookmakers') AS b
+                  CROSS JOIN LATERAL jsonb_array_elements(b->'markets')           AS m
+                  WHERE b ? 'key' AND m ? 'key'
+                ),
+                rows AS (
+                  SELECT
+                    game_id                                   AS game_uid,
+                    market_key,
+                    book_key,
+                    LOWER(COALESCE(o->>'name',''))            AS side_raw,
+                    CASE WHEN (o->>'price') ~ '^-?\\d+$' THEN (o->>'price')::int ELSE NULL END AS price,
+                    NULLIF(o->>'point','')::numeric           AS point,
+                    COALESCE(NULLIF(o->>'last_update','')::timestamptz, market_last_update) AS last_update,
+                    fetched_at                                AS observed_at
+                  FROM bm
+                  CROSS JOIN LATERAL jsonb_array_elements(outcomes) AS o
+                )
                 INSERT INTO odds_norm.odds
-                    (game_uid, market_key, book_key, side, price, point, last_update, observed_at)
+                  (game_uid, market_key, book_key, side, price, point, last_update, observed_at)
                 SELECT
-                    r.game_id,
-                    r.market_key,
-                    r.book_key,
-                    r.side,
-                    CASE
-                      WHEN COALESCE(r.price::text,'') ~ '^-?\\d+$' THEN r.price::int
-                      ELSE NULL
-                    END AS price,
-                    NULLIF(r.point::text,'')::numeric AS point,
-                    r.last_update,
-                    COALESCE(r.observed_at, now())
-                FROM public.odds_raw r
-                WHERE r.game_id IS NOT NULL
-                  AND r.market_key IS NOT NULL
+                  r.game_uid,
+                  r.market_key,
+                  r.book_key,
+                  CASE r.side_raw
+                    WHEN 'home' THEN 'home'
+                    WHEN 'away' THEN 'away'
+                    WHEN 'draw' THEN 'draw'
+                    WHEN 'over' THEN 'over'
+                    WHEN 'under' THEN 'under'
+                    ELSE r.side_raw
+                  END AS side,
+                  r.price,
+                  r.point,
+                  r.last_update,
+                  r.observed_at
+                FROM rows r
+                WHERE r.market_key IS NOT NULL
                   AND r.book_key IS NOT NULL
                   AND r.last_update IS NOT NULL
-                  AND r.side IN ('home','away','draw')
-                  AND COALESCE(r.price::text,'') ~ '^-?\\d+$'
-            """
-            odds_params = []
-            if limit and limit > 0:
-                odds_sql += " LIMIT %s"
-                odds_params.append(limit)
-            odds_sql += """
+                  AND r.price IS NOT NULL
+                  AND r.side_raw IN ('home','away','draw','over','under')
                 ON CONFLICT (game_uid, market_key, book_key, side, last_update) DO NOTHING
                 RETURNING 1
             """
-            await cur.execute(odds_sql, tuple(odds_params))
+            await cur.execute(odds_sql, params)
             o = len(await cur.fetchall())
 
         return {"normalized": {"games": g, "markets": m, "odds_inserts": o}, "dry_run": False}
 
     except Exception as e:
+        # surface message for quick diagnosis
         return {"error": "normalize_failed", "message": str(e)}
