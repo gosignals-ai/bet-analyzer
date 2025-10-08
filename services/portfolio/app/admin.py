@@ -53,7 +53,7 @@ async def normalize_from_raw(
     ok: bool = Depends(_auth),
 ):
     """
-    Normalize public.odds_raw.payload (JSONB) → odds_norm.games/markets/odds.
+    Normalize public.odds_raw.payload (JSONB) â†’ odds_norm.games/markets/odds.
     - De-duplicate per unique target key before INSERT to avoid ON CONFLICT double-update error.
     """
     if dry_run:
@@ -219,3 +219,17 @@ async def normalize_from_raw(
 
     except Exception as e:
         return {"error": "normalize_failed", "message": str(e)}
+
+# --- diagnostic: normalized table counts ---
+@router.get("/admin/norm_counts")
+async def norm_counts(ok: bool = Depends(_auth)):
+    pool = get_pool()
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT count(*) FROM odds_norm.games")
+            g = (await cur.fetchone())[0] or 0
+            await cur.execute("SELECT count(*) FROM odds_norm.markets")
+            m = (await cur.fetchone())[0] or 0
+            await cur.execute("SELECT count(*) FROM odds_norm.odds")
+            o = (await cur.fetchone())[0] or 0
+    return {"games": int(g), "markets": int(m), "odds": int(o)}
