@@ -233,3 +233,47 @@ async def norm_counts(ok: bool = Depends(_auth)):
             await cur.execute("SELECT count(*) FROM odds_norm.odds")
             o = (await cur.fetchone())[0] or 0
     return {"games": int(g), "markets": int(m), "odds": int(o)}
+
+
+# --- diagnostics: db info & raw counts ---
+from urllib.parse import urlparse
+import hashlib, os
+
+def _dsn_to_summary(name: str, dsn: str):
+    try:
+        u = urlparse(dsn)
+        host = (u.hostname or "unknown")
+        db   = (u.path or "/").lstrip("/")
+        sha8 = hashlib.sha256(dsn.encode("utf-8")).hexdigest()[:8]
+        return {"var": name, "host": host, "db": db, "sha8": sha8}
+    except Exception:
+        return {"var": name, "error": "parse_failed"}
+
+@router.get("/db_info", tags=["admin"])
+async def db_info(ok: bool = Depends(_auth)):
+    # Summarize known DSN env vars without leaking secrets
+    candidates = ["DB_URL_EXT", "DB_URL", "DATABASE_URL"]
+    env_seen = []
+    for k in candidates:
+        v = os.environ.get(k)
+        if v:
+            env_seen.append(_dsn_to_summary(k, v))
+
+    pool = get_pool()
+    runtime = {}
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            # what DB are we actually connected to?
+            await cur.execute("select current_database(), inet_server_addr()::text, inet_server_port()::int")
+            dbname, host, port = await cur.fetchone()
+            runtime = {"current_database": dbname, "server_addr": host, "port": int(port)}
+    return {"env_dsns": env_seen, "runtime": runtime}
+
+@router.get("/raw_counts", tags=["admin"])
+async def raw_counts(ok: bool = Depends(_auth)):
+    pool = get_pool()
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("select count(*) from public.odds_raw")
+            raw = (await cur.fetchone())[0]
+    return {"odds_raw": int(raw or 0)}
