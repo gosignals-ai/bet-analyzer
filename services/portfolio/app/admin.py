@@ -1,292 +1,210 @@
-import os
-from typing import Optional
+from __future__ import annotations
+import os, hashlib
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from services.gsa_portfolio.db import get_pool
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-def _auth(authorization: Optional[str] = Header(None)) -> bool:
-    token = os.environ.get("SHARED_TASK_TOKEN") or os.environ.get("PORTFOLIO_ADMIN_TOKEN")
+# -------- auth helper --------
+def _auth(authorization: str | None = Header(None)):
+    token = os.environ.get("SHARED_TASK_TOKEN")
     if not token:
-        raise HTTPException(status_code=500, detail="server_token_missing")
+        raise HTTPException(status_code=401, detail="unauthorized")
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="unauthorized")
     if authorization.split(" ", 1)[1] != token:
         raise HTTPException(status_code=403, detail="forbidden")
     return True
 
-@router.get("/__ping")
+# -------- basic admin utilities --------
+@router.get("/__ping", summary="  Ping")
 async def __ping(ok: bool = Depends(_auth)):
-    await conn.commit()
     return {"ok": True, "svc": "portfolio-admin"}
 
-@router.get("/__debug_token")
+@router.get("/__debug_token", summary="  Debug Token")
 async def __debug_token():
-    import hashlib
-    token = os.environ.get("SHARED_TASK_TOKEN") or ""
-    sha8 = hashlib.sha256(token.encode("utf-8")).hexdigest()[:8] if token else None
-    await conn.commit()
-    return {"expected_sha8": sha8, "len_expected": len(token) if token else 0}
+    tok = os.environ.get("SHARED_TASK_TOKEN", "")
+    sha8 = hashlib.sha256(tok.encode()).hexdigest()[:8] if tok else None
+    return {"expected_sha8": sha8, "len_expected": len(tok)}
 
-@router.post("/retention")
-async def run_retention(
-    dry_run: bool = Query(False),
-    ok: bool = Depends(_auth),
-):
+# -------- retention (optional; no-op if function missing) --------
+@router.post("/retention", summary="Run Retention")
+async def run_retention(dry_run: bool = Query(False), ok: bool = Depends(_auth)):
     pool = get_pool()
     async with pool.connection() as conn, conn.cursor() as cur:
+        try:
+            await cur.execute(
+                "SELECT * FROM retention.purge_portfolios_395d(%s,%s,%s);",
+                (None, None, dry_run),
+            )
+            row = await cur.fetchone()
+            affected = int(row[0]) if row else 0
+        except Exception:
+            affected = 0
         if dry_run:
-            await cur.execute("SELECT count(*)::bigint FROM portfolios WHERE created_at < now() - interval '395 days'")
-            affected = (await cur.fetchone())[0]
+            await conn.rollback()
+        else:
             await conn.commit()
-            return {"purged": int(affected), "dry_run": True}
+    return {"purged": affected, "dry_run": bool(dry_run)}
 
-        await cur.execute(
-            "SELECT retention.purge_portfolios_395d(p_batch := %s, p_hard_cap := %s, p_dry_run := %s)",
-            (50000, 5000000, False),
-        )
-        row = await cur.fetchone()
-        affected = row[0] if row else 0
-        await conn.commit()
-        return {"purged": int(affected), "dry_run": False}
-
-@router.post("/normalize")
-async def normalize_from_raw(
-    dry_run: bool = Query(True),
-    limit: Optional[int] = Query(None, description="cap odds_raw rows considered"),
-    ok: bool = Depends(_auth),
-):
-    """
-    Normalize public.odds_raw.payload (JSONB) Ã¢â€ â€™ odds_norm.games/markets/odds.
-    - De-duplicate per unique target key before INSERT to avoid ON CONFLICT double-update error.
-    """
-    if dry_run:
-        await conn.commit()
-        return {"normalized": {"games": 0, "markets": 0, "odds_inserts": 0}, "dry_run": True}
-
-    pool = get_pool()
-    try:
-        async with pool.connection() as conn, conn.cursor() as cur:
-            await cur.execute("CREATE SCHEMA IF NOT EXISTS odds_norm")
-
-            # Bind limit param if provided
-            limit_clause = " LIMIT %s" if (limit and limit > 0) else ""
-            params = (limit,) if limit_clause else tuple()
-
-            # ---- GAMES (dedup latest by game_id) ----
-            games_sql = f"""
-                WITH src AS (
-                  SELECT game_id, fetched_at, payload
-                  FROM public.odds_raw
-                  WHERE game_id IS NOT NULL
-                  ORDER BY fetched_at DESC
-                  {limit_clause}
-                ),
-                latest AS (
-                  SELECT DISTINCT ON (game_id)
-                         game_id, fetched_at, payload
-                  FROM src
-                  ORDER BY game_id, fetched_at DESC
-                )
-                INSERT INTO odds_norm.games (game_uid, sport_key, commence_time, home_team, away_team, status)
-                SELECT
-                    l.game_id                                          AS game_uid,
-                    l.payload->>'sport_key'                            AS sport_key,
-                    NULLIF(l.payload->>'commence_time','')::timestamptz AS commence_time,
-                    l.payload->>'home_team'                            AS home_team,
-                    l.payload->>'away_team'                            AS away_team,
-                    NULL                                               AS status
-                FROM latest l
-                ON CONFLICT (game_uid) DO UPDATE SET
-                    sport_key     = EXCLUDED.sport_key,
-                    commence_time = EXCLUDED.commence_time,
-                    home_team     = EXCLUDED.home_team,
-                    away_team     = EXCLUDED.away_team,
-                    updated_at    = now()
-                RETURNING 1
-            """
-            await cur.execute(games_sql, params)
-            g = len(await cur.fetchall())
-
-            # ---- MARKETS (dedup by game_id, market_key, book_key) ----
-            markets_sql = f"""
-                WITH src AS (
-                  SELECT game_id, fetched_at, payload
-                  FROM public.odds_raw
-                  WHERE game_id IS NOT NULL
-                  ORDER BY fetched_at DESC
-                  {limit_clause}
-                ),
-                bm AS (
-                  SELECT
-                    s.game_id,
-                    s.fetched_at,
-                    (b->>'key') AS book_key,
-                    (m->>'key') AS market_key,
-                    COALESCE(NULLIF(m->>'last_update','')::timestamptz, s.fetched_at) AS last_update
-                  FROM src s
-                  CROSS JOIN LATERAL jsonb_array_elements(s.payload->'bookmakers') AS b
-                  CROSS JOIN LATERAL jsonb_array_elements(b->'markets')           AS m
-                  WHERE b ? 'key' AND m ? 'key'
-                ),
-                bm_dedup AS (
-                  SELECT game_id, market_key, book_key, MAX(last_update) AS last_update
-                  FROM bm
-                  GROUP BY game_id, market_key, book_key
-                )
-                INSERT INTO odds_norm.markets (game_uid, market_key, book_key, market_ref, last_update)
-                SELECT game_id, market_key, book_key, NULL, last_update
-                FROM bm_dedup
-                ON CONFLICT (game_uid, market_key, book_key) DO UPDATE
-                  SET last_update = GREATEST(odds_norm.markets.last_update, EXCLUDED.last_update),
-                      updated_at = now()
-                RETURNING 1
-            """
-            await cur.execute(markets_sql, params)
-            m = len(await cur.fetchall())
-
-            # ---- ODDS (filter + dedup by full unique key) ----
-            odds_sql = f"""
-                WITH src AS (
-                  SELECT game_id, fetched_at, payload
-                  FROM public.odds_raw
-                  WHERE game_id IS NOT NULL
-                  ORDER BY fetched_at DESC
-                  {limit_clause}
-                ),
-                bm AS (
-                  SELECT
-                    s.game_id,
-                    s.fetched_at,
-                    (b->>'key') AS book_key,
-                    (m->>'key') AS market_key,
-                    COALESCE(NULLIF(m->>'last_update','')::timestamptz, s.fetched_at) AS market_last_update,
-                    (m->'outcomes') AS outcomes
-                  FROM src s
-                  CROSS JOIN LATERAL jsonb_array_elements(s.payload->'bookmakers') AS b
-                  CROSS JOIN LATERAL jsonb_array_elements(b->'markets')           AS m
-                  WHERE b ? 'key' AND m ? 'key'
-                ),
-                rows_base AS (
-                  SELECT
-                    game_id                                   AS game_uid,
-                    market_key,
-                    book_key,
-                    LOWER(COALESCE(o->>'name',''))            AS side_raw,
-                    CASE WHEN (o->>'price') ~ '^-?\\d+$' THEN (o->>'price')::int ELSE NULL END AS price,
-                    NULLIF(o->>'point','')::numeric           AS point,
-                    COALESCE(NULLIF(o->>'last_update','')::timestamptz, market_last_update) AS last_update,
-                    fetched_at                                AS observed_at
-                  FROM bm
-                  CROSS JOIN LATERAL jsonb_array_elements(outcomes) AS o
-                ),
-                rows_flt AS (
-                  SELECT *
-                  FROM rows_base
-                  WHERE market_key IS NOT NULL
-                    AND book_key IS NOT NULL
-                    AND last_update IS NOT NULL
-                    AND price IS NOT NULL
-                    AND side_raw IN ('home','away','draw','over','under')
-                ),
-                rows_dedup AS (
-                  SELECT DISTINCT ON (game_uid, market_key, book_key, side_raw, last_update)
-                         game_uid, market_key, book_key, side_raw, price, point, last_update, observed_at
-                  FROM rows_flt
-                  ORDER BY game_uid, market_key, book_key, side_raw, last_update DESC, observed_at DESC
-                )
-                INSERT INTO odds_norm.odds
-                  (game_uid, market_key, book_key, side, price, point, last_update, observed_at)
-                SELECT
-                  game_uid,
-                  market_key,
-                  book_key,
-                  CASE side_raw
-                    WHEN 'home' THEN 'home'
-                    WHEN 'away' THEN 'away'
-                    WHEN 'draw' THEN 'draw'
-                    WHEN 'over' THEN 'over'
-                    WHEN 'under' THEN 'under'
-                    ELSE side_raw
-                  END AS side,
-                  price,
-                  point,
-                  last_update,
-                  observed_at
-                FROM rows_dedup
-                ON CONFLICT (game_uid, market_key, book_key, side, last_update) DO NOTHING
-                RETURNING 1
-            """
-            await cur.execute(odds_sql, params)
-            o = len(await cur.fetchall())
-
-        await conn.commit()
-
-        return {"normalized": {"games": g, "markets": m, "odds_inserts": o}, "dry_run": False}
-
-    except Exception as e:
-        await conn.commit()
-        return {"error": "normalize_failed", "message": str(e)}
-
-# --- diagnostic: normalized table counts ---
-@router.get("/norm_counts")
+# -------- diagnostics --------
+@router.get("/norm_counts", summary="Norm Counts")
 async def norm_counts(ok: bool = Depends(_auth)):
     pool = get_pool()
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("SELECT count(*) FROM odds_norm.games")
-            g = (await cur.fetchone())[0] or 0
-            await cur.execute("SELECT count(*) FROM odds_norm.markets")
-            m = (await cur.fetchone())[0] or 0
-            await cur.execute("SELECT count(*) FROM odds_norm.odds")
-            o = (await cur.fetchone())[0] or 0
-    await conn.commit()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute("SELECT count(*) FROM odds_norm.games");   g = (await cur.fetchone())[0]
+        await cur.execute("SELECT count(*) FROM odds_norm.markets"); m = (await cur.fetchone())[0]
+        await cur.execute("SELECT count(*) FROM odds_norm.odds");    o = (await cur.fetchone())[0]
     return {"games": int(g), "markets": int(m), "odds": int(o)}
 
-
-# --- diagnostics: db info & raw counts ---
-from urllib.parse import urlparse
-import hashlib, os
-
-def _dsn_to_summary(name: str, dsn: str):
-    try:
-        u = urlparse(dsn)
-        host = (u.hostname or "unknown")
-        db   = (u.path or "/").lstrip("/")
-        sha8 = hashlib.sha256(dsn.encode("utf-8")).hexdigest()[:8]
-        await conn.commit()
-        return {"var": name, "host": host, "db": db, "sha8": sha8}
-    except Exception:
-        await conn.commit()
-        return {"var": name, "error": "parse_failed"}
-
-@router.get("/db_info", tags=["admin"])
-async def db_info(ok: bool = Depends(_auth)):
-    # Summarize known DSN env vars without leaking secrets
-    candidates = ["DB_URL_EXT", "DB_URL", "DATABASE_URL"]
-    env_seen = []
-    for k in candidates:
-        v = os.environ.get(k)
-        if v:
-            env_seen.append(_dsn_to_summary(k, v))
-
-    pool = get_pool()
-    runtime = {}
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            # what DB are we actually connected to?
-            await cur.execute("select current_database(), inet_server_addr()::text, inet_server_port()::int")
-            dbname, host, port = await cur.fetchone()
-            runtime = {"current_database": dbname, "server_addr": host, "port": int(port)}
-    await conn.commit()
-    return {"env_dsns": env_seen, "runtime": runtime}
-
-@router.get("/raw_counts", tags=["admin"])
+@router.get("/raw_counts", summary="Raw Counts")
 async def raw_counts(ok: bool = Depends(_auth)):
     pool = get_pool()
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("select count(*) from public.odds_raw")
-            raw = (await cur.fetchone())[0]
-    await conn.commit()
-    return {"odds_raw": int(raw or 0)}
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute("SELECT count(*) FROM public.odds_raw")
+        n = (await cur.fetchone())[0]
+    return {"odds_raw": int(n)}
+
+@router.get("/db_info", summary="DB Info")
+async def db_info(ok: bool = Depends(_auth)):
+    env_dsn = os.environ.get("DATABASE_URL", "")
+    parsed = {"var": "DATABASE_URL", "host": None, "db": None, "sha8": None}
+    if env_dsn.startswith(("postgres://", "postgresql://")):
+        try:
+            rest = env_dsn.split("://", 1)[1].split("@")[-1]
+            host = rest.split("/", 1)[0].split(":")[0]
+            db = rest.split("/", 1)[1].split("?")[0]
+            parsed = {"var":"DATABASE_URL","host":host,"db":db,
+                      "sha8": hashlib.sha256(env_dsn.encode()).hexdigest()[:8]}
+        except Exception:
+            pass
+
+    pool = get_pool()
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute("select current_database(), inet_server_addr(), inet_server_port()")
+        current_database, server_addr, port = await cur.fetchone()
+    return {"env_dsns":[parsed], "runtime":{
+        "current_database": current_database, "server_addr": str(server_addr), "port": int(port)
+    }}
+
+# -------- normalize from public.odds_raw --------
+@router.post(
+    "/normalize",
+    summary="Normalize From Raw",
+    description=(
+        "Normalize public.odds_raw.payload (JSONB) → odds_norm.games/markets/odds. "
+        "DISTINCT prevents ON CONFLICT double-update; side is mapped to 'home'/'away'."
+    ),
+)
+async def normalize_from_raw(
+    dry_run: bool = Query(True, description="no writes when true"),
+    limit: int | None = Query(None, description="cap odds_raw rows considered"),
+    ok: bool = Depends(_auth),
+):
+    pool = get_pool()
+    lim_clause = "LIMIT %s" if limit else ""
+    lim_arg = (limit,) if limit else tuple()
+
+    async with pool.connection() as conn, conn.cursor() as cur:
+        # GAMES
+        await cur.execute(
+            f"""
+            WITH src AS (
+              SELECT DISTINCT
+                (payload->>'id')::text                   AS game_uid,
+                payload->>'sport_key'                    AS sport_key,
+                (payload->>'commence_time')::timestamptz AS commence_time,
+                payload->>'away_team'                    AS away_team,
+                payload->>'home_team'                    AS home_team
+              FROM public.odds_raw
+              ORDER BY fetched_at DESC
+              {lim_clause}
+            )
+            INSERT INTO odds_norm.games (game_uid, sport_key, commence_time, away_team, home_team)
+            SELECT game_uid, sport_key, commence_time, away_team, home_team
+            FROM src
+            ON CONFLICT (game_uid) DO UPDATE
+              SET sport_key = EXCLUDED.sport_key,
+                  commence_time = EXCLUDED.commence_time,
+                  away_team = EXCLUDED.away_team,
+                  home_team = EXCLUDED.home_team
+            RETURNING 1
+            """,
+            lim_arg,
+        )
+        g = len(await cur.fetchall())
+
+        # MARKETS
+        await cur.execute(
+            f"""
+            WITH src AS (
+              SELECT DISTINCT
+                (r.payload->>'id')::text AS game_uid,
+                m->>'key'                AS market_key,
+                b->>'key'                AS book_key
+              FROM public.odds_raw r
+              CROSS JOIN LATERAL jsonb_array_elements(r.payload->'bookmakers') AS b
+              CROSS JOIN LATERAL jsonb_array_elements(b->'markets')           AS m
+              ORDER BY r.fetched_at DESC
+              {lim_clause}
+            )
+            INSERT INTO odds_norm.markets (game_uid, market_key, book_key)
+            SELECT game_uid, market_key, book_key
+            FROM src
+            ON CONFLICT (game_uid, market_key, book_key) DO NOTHING
+            RETURNING 1
+            """,
+            lim_arg,
+        )
+        m = len(await cur.fetchall())
+
+        # ODDS
+        await cur.execute(
+            f"""
+            WITH src AS (
+              SELECT DISTINCT
+                (r.payload->>'id')::text AS game_uid,
+                m->>'key'                AS market_key,
+                b->>'key'                AS book_key,
+                o->>'name'               AS side_raw,
+                o->>'price'              AS price_raw,
+                o->>'point'              AS point_raw,
+                COALESCE(NULLIF(b->>'last_update',''), to_char(r.fetched_at,'YYYY-MM-DD"T"HH24:MI:SSOF')) AS last_update_raw,
+                r.fetched_at             AS observed_at
+              FROM public.odds_raw r
+              CROSS JOIN LATERAL jsonb_array_elements(r.payload->'bookmakers') AS b
+              CROSS JOIN LATERAL jsonb_array_elements(b->'markets')           AS m
+              CROSS JOIN LATERAL jsonb_array_elements(m->'outcomes')          AS o
+              ORDER BY r.fetched_at DESC
+              {lim_clause}
+            )
+            INSERT INTO odds_norm.odds
+              (game_uid, market_key, book_key, side, price, point, last_update, observed_at)
+            SELECT
+              game_uid,
+              market_key,
+              book_key,
+              CASE
+                WHEN lower(side_raw) IN ('home','1','over')  THEN 'home'
+                WHEN lower(side_raw) IN ('away','2','under') THEN 'away'
+                ELSE NULL
+              END AS side,
+              CASE WHEN price_raw ~ E'^-?\\d+$'           THEN price_raw::int     ELSE NULL END AS price,
+              CASE WHEN point_raw ~ E'^-?\\d+(\\.\\d+)?$' THEN point_raw::numeric ELSE NULL END AS point,
+              COALESCE(NULLIF(last_update_raw,'')::timestamptz, now())          AS last_update,
+              observed_at
+            FROM src
+            WHERE lower(side_raw) IN ('home','1','over','away','2','under')
+            ON CONFLICT (game_uid, market_key, book_key, side, last_update) DO NOTHING
+            RETURNING 1
+            """,
+            lim_arg,
+        )
+        o = len(await cur.fetchall())
+
+        if dry_run:
+            await conn.rollback()
+        else:
+            await conn.commit()
+
+    return {"normalized": {"games": g, "markets": m, "odds_inserts": o}, "dry_run": bool(dry_run)}
