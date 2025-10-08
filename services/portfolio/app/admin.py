@@ -1,4 +1,4 @@
-﻿import os
+import os
 from typing import Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from services.gsa_portfolio.db import get_pool
@@ -17,6 +17,7 @@ def _auth(authorization: Optional[str] = Header(None)) -> bool:
 
 @router.get("/__ping")
 async def __ping(ok: bool = Depends(_auth)):
+    await conn.commit()
     return {"ok": True, "svc": "portfolio-admin"}
 
 @router.get("/__debug_token")
@@ -24,6 +25,7 @@ async def __debug_token():
     import hashlib
     token = os.environ.get("SHARED_TASK_TOKEN") or ""
     sha8 = hashlib.sha256(token.encode("utf-8")).hexdigest()[:8] if token else None
+    await conn.commit()
     return {"expected_sha8": sha8, "len_expected": len(token) if token else 0}
 
 @router.post("/retention")
@@ -36,6 +38,7 @@ async def run_retention(
         if dry_run:
             await cur.execute("SELECT count(*)::bigint FROM portfolios WHERE created_at < now() - interval '395 days'")
             affected = (await cur.fetchone())[0]
+            await conn.commit()
             return {"purged": int(affected), "dry_run": True}
 
         await cur.execute(
@@ -44,6 +47,7 @@ async def run_retention(
         )
         row = await cur.fetchone()
         affected = row[0] if row else 0
+        await conn.commit()
         return {"purged": int(affected), "dry_run": False}
 
 @router.post("/normalize")
@@ -57,6 +61,7 @@ async def normalize_from_raw(
     - De-duplicate per unique target key before INSERT to avoid ON CONFLICT double-update error.
     """
     if dry_run:
+        await conn.commit()
         return {"normalized": {"games": 0, "markets": 0, "odds_inserts": 0}, "dry_run": True}
 
     pool = get_pool()
@@ -215,9 +220,12 @@ async def normalize_from_raw(
             await cur.execute(odds_sql, params)
             o = len(await cur.fetchall())
 
+        await conn.commit()
+
         return {"normalized": {"games": g, "markets": m, "odds_inserts": o}, "dry_run": False}
 
     except Exception as e:
+        await conn.commit()
         return {"error": "normalize_failed", "message": str(e)}
 
 # --- diagnostic: normalized table counts ---
@@ -232,6 +240,7 @@ async def norm_counts(ok: bool = Depends(_auth)):
             m = (await cur.fetchone())[0] or 0
             await cur.execute("SELECT count(*) FROM odds_norm.odds")
             o = (await cur.fetchone())[0] or 0
+    await conn.commit()
     return {"games": int(g), "markets": int(m), "odds": int(o)}
 
 
@@ -245,8 +254,10 @@ def _dsn_to_summary(name: str, dsn: str):
         host = (u.hostname or "unknown")
         db   = (u.path or "/").lstrip("/")
         sha8 = hashlib.sha256(dsn.encode("utf-8")).hexdigest()[:8]
+        await conn.commit()
         return {"var": name, "host": host, "db": db, "sha8": sha8}
     except Exception:
+        await conn.commit()
         return {"var": name, "error": "parse_failed"}
 
 @router.get("/db_info", tags=["admin"])
@@ -267,6 +278,7 @@ async def db_info(ok: bool = Depends(_auth)):
             await cur.execute("select current_database(), inet_server_addr()::text, inet_server_port()::int")
             dbname, host, port = await cur.fetchone()
             runtime = {"current_database": dbname, "server_addr": host, "port": int(port)}
+    await conn.commit()
     return {"env_dsns": env_seen, "runtime": runtime}
 
 @router.get("/raw_counts", tags=["admin"])
@@ -276,4 +288,5 @@ async def raw_counts(ok: bool = Depends(_auth)):
         async with conn.cursor() as cur:
             await cur.execute("select count(*) from public.odds_raw")
             raw = (await cur.fetchone())[0]
+    await conn.commit()
     return {"odds_raw": int(raw or 0)}
