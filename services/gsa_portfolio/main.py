@@ -1,59 +1,363 @@
-﻿import os
-from typing import List
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+# services/gsa_portfolio/main.py
+# FastAPI app for GSA Portfolio (admin endpoints + normalization)
+# - Auth via 64-char token in "Authorization: Bearer <TOKEN>" or "x-gsa-token"
+# - DB via psycopg async pool using DATABASE_URL
+# - Fixed source SELECT using DISTINCT ON (..., fetched_at DESC)
+
+from __future__ import annotations
+
+import os
+import json
+import hashlib
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
 import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
-APP_NAME = "gsa_portfolio"
-DB_URL = os.getenv("DATABASE_URL")
+# --------------------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------------------
 
-app = FastAPI(title="GoSignals Portfolio", version="0.1.0")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
 
-class PortfolioIn(BaseModel):
-    name: str = Field(..., min_length=1, max_length=64)
-    balance: float = 0.0
-    currency: str = "USD"
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN") or os.environ.get("TOKEN")
+ADMIN_LEN_EXPECTED = 64
 
+# Small async pool; Render free tier is modest
+pool = AsyncConnectionPool(
+    conninfo=DATABASE_URL,
+    min_size=1,
+    max_size=5,
+    open=False,  # open lazily
+)
+
+app = FastAPI(title="GSA Portfolio")
+router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+# --------------------------------------------------------------------------------------
+# Auth
+# --------------------------------------------------------------------------------------
+
+def _sha8(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:8]
+
+
+async def require_admin(
+    authorization: Optional[str] = Header(None, convert_underscores=False),
+    x_gsa_token: Optional[str] = Header(None),
+) -> str:
+    """Allow either Bearer or x-gsa-token; compare to server token exactly."""
+    if not ADMIN_TOKEN or len(ADMIN_TOKEN) != ADMIN_LEN_EXPECTED:
+        raise HTTPException(status_code=500, detail="admin token not configured")
+
+    supplied: Optional[str] = None
+    if authorization and authorization.lower().startswith("bearer "):
+        supplied = authorization.split(" ", 1)[1].strip()
+    if not supplied and x_gsa_token:
+        supplied = x_gsa_token.strip()
+
+    if not supplied:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    if supplied == ADMIN_TOKEN:
+        return supplied
+    raise HTTPException(status_code=401, detail="unauthorized")
+
+
+async def _ensure_pool_open() -> None:
+    if pool.closed:
+        await pool.open()
+
+
+# --------------------------------------------------------------------------------------
+# Models
+# --------------------------------------------------------------------------------------
+
+class Counts(BaseModel):
+    games: int
+    markets: int
+    odds: int
+
+
+# --------------------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------------------
+
+def _safe_market_side(market_key: str, outcome_name: str, home_team: str, away_team: str) -> Optional[str]:
+    """
+    Map outcome 'name' to canonical side for each market.
+    - h2h/spreads: 'home' or 'away'
+    - totals: 'over' or 'under'
+    """
+    mk = (market_key or "").strip().lower()
+    nm = (outcome_name or "").strip().lower()
+    h = (home_team or "").strip().lower()
+    a = (away_team or "").strip().lower()
+
+    if mk in ("h2h", "spreads", "spread", "line"):
+        if nm in ("home", h):
+            return "home"
+        if nm in ("away", a):
+            return "away"
+        return None
+
+    if mk in ("totals", "total", "over_under"):
+        if nm.startswith("over"):
+            return "over"
+        if nm.startswith("under"):
+            return "under"
+        return None
+
+    return None
+
+
+# --------------------------------------------------------------------------------------
+# Admin endpoints
+# --------------------------------------------------------------------------------------
+
+@router.get("/__ping")
+async def __ping(_: str = Depends(require_admin)) -> Dict[str, Any]:
+    return {"ok": True}
+
+
+@router.get("/__debug_token")
+async def __debug_token(_: Request) -> Dict[str, Any]:
+    return {
+        "expected_sha8": _sha8(ADMIN_TOKEN) if ADMIN_TOKEN else None,
+        "len_expected": ADMIN_LEN_EXPECTED,
+    }
+
+
+@router.get("/db_info")
+async def db_info(_: str = Depends(require_admin)) -> Dict[str, Any]:
+    await _ensure_pool_open()
+    async with pool.connection() as ac, ac.cursor(row_factory=dict_row) as cur:
+        await cur.execute("select current_database() as db, current_schema() as schema;")
+        row = await cur.fetchone()
+
+    # Redact password in DSN (best-effort)
+    dsn = DATABASE_URL
+    try:
+        pre, rest = dsn.split("://", 1)
+        userinfo, hostpart = rest.split("@", 1)
+        user = userinfo.split(":")[0]
+        dsn = f"{pre}://{user}:***@{hostpart}"
+    except Exception:
+        pass
+
+    return {"dsn": dsn, "runtime": row}
+
+
+@router.get("/raw_counts")
+async def raw_counts(_: str = Depends(require_admin)) -> Dict[str, int]:
+    await _ensure_pool_open()
+    async with pool.connection() as ac, ac.cursor() as cur:
+        await cur.execute("select count(*) from public.odds_raw;")
+        (n,) = await cur.fetchone()
+    return {"odds_raw": int(n)}
+
+
+@router.get("/norm_counts", response_model=Counts)
+async def norm_counts(_: str = Depends(require_admin)) -> Counts:
+    await _ensure_pool_open()
+    async with pool.connection() as ac, ac.cursor() as cur:
+        await cur.execute("select count(*) from odds_norm.games;")
+        (g,) = await cur.fetchone()
+        await cur.execute("select count(*) from odds_norm.markets;")
+        (m,) = await cur.fetchone()
+        await cur.execute("select count(*) from odds_norm.odds;")
+        (o,) = await cur.fetchone()
+    return Counts(games=int(g), markets=int(m), odds=int(o))
+
+
+@router.post("/normalize")
+async def normalize_from_raw(
+    _: str = Depends(require_admin),
+    dry_run: bool = Query(True),
+    limit: int = Query(200, ge=1, le=10000),
+) -> JSONResponse:
+    """
+    Normalize data from public.odds_raw.payload into odds_norm.* tables.
+    - Dedup source using DISTINCT ON (game_id, sport_key, payload_hash), latest by fetched_at.
+    - Idempotent upserts with ON CONFLICT guards.
+    - dry_run=true -> compute would-be inserts, no writes.
+    """
+    await _ensure_pool_open()
+
+    # 1) Source selection (fixed: DISTINCT ON + ordered by fetched_at DESC)
+    async with pool.connection() as ac, ac.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT DISTINCT ON (game_id, sport_key, payload_hash)
+                id, sport_key, game_id, fetched_at, payload, payload_hash
+            FROM public.odds_raw
+            ORDER BY game_id, sport_key, payload_hash, fetched_at DESC
+            LIMIT %(limit)s
+            """,
+            {"limit": limit},
+        )
+        rows: List[Dict[str, Any]] = await cur.fetchall()
+
+    if not rows:
+        return JSONResponse({"ok": True, "source": {"rows": 0}, "dry_run": dry_run, "limit": limit})
+
+    # Counters (we'll increment in both dry_run and write paths for visibility)
+    ins_games = 0
+    ins_markets = 0
+    ins_odds = 0
+
+    async with pool.connection() as ac:
+        async with ac.cursor() as cur:
+            for r in rows:
+                sport_key: str = r["sport_key"]
+                game_id_raw: str = r["game_id"]
+                payload = r["payload"]
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+
+                gid = payload.get("id") or game_id_raw
+                home_team = (payload.get("home_team") or "").strip()
+                away_team = (payload.get("away_team") or "").strip()
+                commence_time = payload.get("commence_time")
+                game_uid = f"{sport_key}:{gid}"
+
+                # -- games
+                if dry_run:
+                    ins_games += 1
+                else:
+                    await cur.execute(
+                        """
+                        INSERT INTO odds_norm.games (game_uid, sport_key, game_id, home_team, away_team, commence_time)
+                        VALUES (%(game_uid)s, %(sport_key)s, %(game_id)s, %(home_team)s, %(away_team)s, %(commence_time)s)
+                        ON CONFLICT (game_uid) DO UPDATE
+                          SET home_team = EXCLUDED.home_team,
+                              away_team = EXCLUDED.away_team,
+                              commence_time = EXCLUDED.commence_time
+                        """,
+                        {
+                            "game_uid": game_uid,
+                            "sport_key": sport_key,
+                            "game_id": gid,
+                            "home_team": home_team,
+                            "away_team": away_team,
+                            "commence_time": commence_time,
+                        },
+                    )
+                    # rowcount isn’t reliable for upserts; we still surface totals via separate counts
+
+                # -- markets & odds
+                bookmakers = payload.get("bookmakers") or []
+                for bk in bookmakers:
+                    book_key = (bk.get("key") or "").strip()
+                    book_ts = bk.get("last_update") or bk.get("lastUpdate") or payload.get("fetched_at")
+
+                    markets = bk.get("markets") or []
+                    for mk in markets:
+                        market_key = (mk.get("key") or "").strip().lower()
+                        m_ts = mk.get("last_update") or mk.get("lastUpdate") or book_ts
+
+                        if dry_run:
+                            ins_markets += 1
+                        else:
+                            await cur.execute(
+                                """
+                                INSERT INTO odds_norm.markets (game_uid, market_key, book_key, last_update)
+                                VALUES (%(game_uid)s, %(market_key)s, %(book_key)s, %(last_update)s)
+                                ON CONFLICT (game_uid, market_key, book_key) DO UPDATE
+                                  SET last_update = GREATEST(odds_norm.markets.last_update, EXCLUDED.last_update)
+                                """,
+                                {
+                                    "game_uid": game_uid,
+                                    "market_key": market_key,
+                                    "book_key": book_key,
+                                    "last_update": m_ts,
+                                },
+                            )
+
+                        for oc in mk.get("outcomes") or []:
+                            name = oc.get("name") or ""
+                            side = _safe_market_side(market_key, name, home_team, away_team)
+                            if not side:
+                                continue
+
+                            price = oc.get("price") or oc.get("odds")
+                            point = oc.get("point")
+                            last_update = oc.get("last_update") or oc.get("lastUpdate") or m_ts
+
+                            if market_key in ("totals", "total", "over_under"):
+                                # Enforce check constraint with canonical values
+                                if side not in ("over", "under"):
+                                    continue
+
+                            if dry_run:
+                                ins_odds += 1
+                            else:
+                                await cur.execute(
+                                    """
+                                    INSERT INTO odds_norm.odds
+                                        (game_uid, market_key, book_key, side, price, point, last_update)
+                                    VALUES
+                                        (%(game_uid)s, %(market_key)s, %(book_key)s, %(side)s, %(price)s, %(point)s, %(last_update)s)
+                                    ON CONFLICT (game_uid, market_key, book_key, side, last_update) DO NOTHING
+                                    """,
+                                    {
+                                        "game_uid": game_uid,
+                                        "market_key": market_key,
+                                        "book_key": book_key,
+                                        "side": side,
+                                        "price": price,
+                                        "point": point,
+                                        "last_update": last_update,
+                                    },
+                                )
+
+            if dry_run:
+                await ac.rollback()
+            else:
+                await ac.commit()
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "dry_run": dry_run,
+            "limit": limit,
+            "source": {"rows": len(rows)},
+            "counts": {
+                "games": ins_games,
+                "markets": ins_markets,
+                "odds": ins_odds,
+            },
+        }
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Lifecycle & wiring
+# --------------------------------------------------------------------------------------
+
+@app.on_event("startup")
+async def _on_startup() -> None:
+    await _ensure_pool_open()
+
+@app.on_event("shutdown")
+async def _on_shutdown() -> None:
+    try:
+        await pool.close()
+    except Exception:
+        pass
+
+# Mount admin router
+app.include_router(router)
+
+# If you need a root for sanity (non-admin), keep it simple and unauthenticated
 @app.get("/")
-def root():
-    return {"service": APP_NAME, "status": "ready"}
-
-@app.get("/health")
-def health():
-    try:
-        with psycopg.connect(DB_URL, connect_timeout=3) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                cur.fetchone()
-        return {"service": APP_NAME, "db": "ok"}
-    except Exception as e:
-        raise HTTPException(500, f"DB error: {e}")
-
-@app.post("/portfolio")
-def create_portfolio(p: PortfolioIn):
-    try:
-        with psycopg.connect(DB_URL) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO portfolios (name, balance, currency) VALUES (%s,%s,%s) RETURNING id",
-                    (p.name, p.balance, p.currency),
-                )
-                pid = cur.fetchone()[0]
-            conn.commit()
-        return {"id": pid, "name": p.name, "balance": float(p.balance), "currency": p.currency}
-    except Exception as e:
-        raise HTTPException(500, f"create error: {e}")
-
-@app.get("/portfolio")
-def list_portfolios():
-    try:
-        with psycopg.connect(DB_URL) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT id, name, balance, currency, created_at FROM portfolios ORDER BY id DESC")
-                rows = cur.fetchall()
-        return [
-            {"id": r[0], "name": r[1], "balance": float(r[2]), "currency": r[3], "created_at": r[4].isoformat()}
-            for r in rows
-        ]
-    except Exception as e:
-        raise HTTPException(500, f"list error: {e}")
+async def root() -> Dict[str, Any]:
+    return {"service": "gsa-portfolio", "status": "ok"}
