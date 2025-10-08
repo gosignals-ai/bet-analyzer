@@ -1,219 +1,333 @@
 # services/portfolio/app.py
-import os, hashlib
-from fastapi import FastAPI, APIRouter, Depends, Header, HTTPException, Query
-from services.gsa_portfolio.db import get_pool
+# FastAPI app for GSA Portfolio (single-file app)
+# - Admin auth via 64-char token in "Authorization: Bearer <TOKEN>" or "x-gsa-token"
+# - DB via psycopg (async) using DATABASE_URL
+# - FIX: uses DISTINCT ON (..., fetched_at DESC) in normalize source SELECT
 
-app = FastAPI(title="GoSignals Portfolio")
-admin = APIRouter(prefix="/admin", tags=["admin"])
+from __future__ import annotations
 
-# ---------- auth ----------
-def _auth(authorization: str | None = Header(None)):
-    token = os.environ.get("SHARED_TASK_TOKEN")
-    if not token:
+import os
+import json
+import hashlib
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
+
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
+
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN") or os.environ.get("TOKEN")
+ADMIN_LEN_EXPECTED = 64
+
+# Small pool (good for Render free/small instances)
+pool = AsyncConnectionPool(
+    conninfo=DATABASE_URL,
+    min_size=1,
+    max_size=5,
+    open=False,  # open lazily
+)
+
+app = FastAPI(title="GSA Portfolio")
+router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+# -----------------------------------------------------------------------------
+# Auth
+# -----------------------------------------------------------------------------
+
+def _sha8(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:8]
+
+
+async def require_admin(
+    authorization: Optional[str] = Header(None, convert_underscores=False),
+    x_gsa_token: Optional[str] = Header(None),
+) -> str:
+    if not ADMIN_TOKEN or len(ADMIN_TOKEN) != ADMIN_LEN_EXPECTED:
+        raise HTTPException(status_code=500, detail="admin token not configured")
+    supplied: Optional[str] = None
+    if authorization and authorization.lower().startswith("bearer "):
+        supplied = authorization.split(" ", 1)[1].strip()
+    if not supplied and x_gsa_token:
+        supplied = x_gsa_token.strip()
+    if not supplied:
         raise HTTPException(status_code=401, detail="unauthorized")
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="unauthorized")
-    if authorization.split(" ", 1)[1] != token:
-        raise HTTPException(status_code=403, detail="forbidden")
-    return True
+    if supplied == ADMIN_TOKEN:
+        return supplied
+    raise HTTPException(status_code=401, detail="unauthorized")
 
-# ---------- health ----------
-@app.get("/", summary="Root")
-def root():
-    return {"service": "gsa_portfolio"}
 
-@app.get("/health", summary="Health")
-async def health():
-    pool = get_pool()
-    async with pool.connection() as conn, conn.cursor() as cur:
-        await cur.execute("select 1")
-        _ = await cur.fetchone()
-    return {"service": "gsa_portfolio", "db": "ok"}
+async def _ensure_pool_open() -> None:
+    if pool.closed:
+        await pool.open()
 
-# ---------- admin basics ----------
-@admin.get("/__ping", summary=" Ping")
-async def __ping(ok: bool = Depends(_auth)):
-    return {"ok": True, "svc": "portfolio-admin"}
 
-@admin.get("/__debug_token", summary=" Debug Token")
-async def __debug_token():
-    tok = os.environ.get("SHARED_TASK_TOKEN", "")
-    sha8 = hashlib.sha256(tok.encode()).hexdigest()[:8] if tok else None
-    return {"expected_sha8": sha8, "len_expected": len(tok)}
+# -----------------------------------------------------------------------------
+# Models & helpers
+# -----------------------------------------------------------------------------
 
-# ---------- retention (optional; keeps previous contract) ----------
-@admin.post("/retention", summary="Run Retention")
-async def run_retention(dry_run: bool = Query(False), ok: bool = Depends(_auth)):
-    pool = get_pool()
-    async with pool.connection() as conn, conn.cursor() as cur:
-        await cur.execute(
-            "SELECT * FROM retention.purge_portfolios_395d(%s,%s,%s);",
-            (None, None, dry_run),
-        )
+class Counts(BaseModel):
+    games: int
+    markets: int
+    odds: int
+
+
+def _safe_market_side(market_key: str, outcome_name: str, home_team: str, away_team: str) -> Optional[str]:
+    mk = (market_key or "").strip().lower()
+    nm = (outcome_name or "").strip().lower()
+    h = (home_team or "").strip().lower()
+    a = (away_team or "").strip().lower()
+
+    if mk in ("h2h", "spreads", "spread", "line"):
+        if nm in ("home", h):
+            return "home"
+        if nm in ("away", a):
+            return "away"
+        return None
+
+    if mk in ("totals", "total", "over_under"):
+        if nm.startswith("over"):
+            return "over"
+        if nm.startswith("under"):
+            return "under"
+        return None
+
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Admin endpoints
+# -----------------------------------------------------------------------------
+
+@router.get("/__ping")
+async def __ping(_: str = Depends(require_admin)) -> Dict[str, Any]:
+    return {"ok": True}
+
+
+@router.get("/__debug_token")
+async def __debug_token(_: Request) -> Dict[str, Any]:
+    return {"expected_sha8": _sha8(ADMIN_TOKEN) if ADMIN_TOKEN else None, "len_expected": ADMIN_LEN_EXPECTED}
+
+
+@router.get("/db_info")
+async def db_info(_: str = Depends(require_admin)) -> Dict[str, Any]:
+    await _ensure_pool_open()
+    async with pool.connection() as ac, ac.cursor(row_factory=dict_row) as cur:
+        await cur.execute("select current_database() as db, current_schema() as schema;")
         row = await cur.fetchone()
-        affected = int(row[0]) if row else 0
-        if dry_run:
-            await conn.rollback()
-        else:
-            await conn.commit()
-    return {"purged": affected, "dry_run": bool(dry_run)}
 
-# ---------- diagnostics ----------
-@admin.get("/norm_counts", summary="Norm Counts")
-async def norm_counts(ok: bool = Depends(_auth)):
-    pool = get_pool()
-    async with pool.connection() as conn, conn.cursor() as cur:
-        await cur.execute("SELECT count(*) FROM odds_norm.games");   g = (await cur.fetchone())[0]
-        await cur.execute("SELECT count(*) FROM odds_norm.markets"); m = (await cur.fetchone())[0]
-        await cur.execute("SELECT count(*) FROM odds_norm.odds");    o = (await cur.fetchone())[0]
-    return {"games": int(g), "markets": int(m), "odds": int(o)}
+    dsn = DATABASE_URL
+    try:
+        pre, rest = dsn.split("://", 1)
+        userinfo, hostpart = rest.split("@", 1)
+        user = userinfo.split(":")[0]
+        dsn = f"{pre}://{user}:***@{hostpart}"
+    except Exception:
+        pass
 
-@admin.get("/raw_counts", summary="Raw Counts")
-async def raw_counts(ok: bool = Depends(_auth)):
-    pool = get_pool()
-    async with pool.connection() as conn, conn.cursor() as cur:
-        await cur.execute("SELECT count(*) FROM public.odds_raw")
-        n = (await cur.fetchone())[0]
+    return {"dsn": dsn, "runtime": row}
+
+
+@router.get("/raw_counts")
+async def raw_counts(_: str = Depends(require_admin)) -> Dict[str, int]:
+    await _ensure_pool_open()
+    async with pool.connection() as ac, ac.cursor() as cur:
+        await cur.execute("select count(*) from public.odds_raw;")
+        (n,) = await cur.fetchone()
     return {"odds_raw": int(n)}
 
-@admin.get("/db_info", summary="DB Info")
-async def db_info(ok: bool = Depends(_auth)):
-    env_dsn = os.environ.get("DATABASE_URL", "")
-    parsed = {"var": "DATABASE_URL", "host": None, "db": None, "sha8": None}
-    if env_dsn.startswith(("postgres://", "postgresql://")):
-        try:
-            rest = env_dsn.split("://", 1)[1].split("@")[-1]
-            host = rest.split("/", 1)[0].split(":")[0]
-            db = rest.split("/", 1)[1].split("?")[0]
-            parsed = {"var":"DATABASE_URL","host":host,"db":db,
-                      "sha8": hashlib.sha256(env_dsn.encode()).hexdigest()[:8]}
-        except Exception:
-            pass
 
-    pool = get_pool()
-    async with pool.connection() as conn, conn.cursor() as cur:
-        await cur.execute("select current_database(), inet_server_addr(), inet_server_port()")
-        current_database, server_addr, port = await cur.fetchone()
-    return {"env_dsns":[parsed], "runtime":{
-        "current_database": current_database, "server_addr": str(server_addr), "port": int(port)
-    }}
+@router.get("/norm_counts", response_model=Counts)
+async def norm_counts(_: str = Depends(require_admin)) -> Counts:
+    await _ensure_pool_open()
+    async with pool.connection() as ac, ac.cursor() as cur:
+        await cur.execute("select count(*) from odds_norm.games;")
+        (g,) = await cur.fetchone()
+        await cur.execute("select count(*) from odds_norm.markets;")
+        (m,) = await cur.fetchone()
+        await cur.execute("select count(*) from odds_norm.odds;")
+        (o,) = await cur.fetchone()
+    return Counts(games=int(g), markets=int(m), odds=int(o))
 
-# ---------- normalize ----------
-@admin.post("/normalize", summary="Normalize From Raw",
-            description=("Normalize public.odds_raw.payload (JSONB) → odds_norm.games/markets/odds. "
-                         "Uses DISTINCT to avoid ON CONFLICT double-update."))
+
+@router.post("/normalize")
 async def normalize_from_raw(
-    dry_run: bool = Query(True, description="no writes when true"),
-    limit: int | None = Query(None, description="cap odds_raw rows considered"),
-    ok: bool = Depends(_auth),
-):
-    pool = get_pool()
-    lim_clause = "LIMIT %s" if limit else ""
-    lim_arg = (limit,) if limit else tuple()
+    _: str = Depends(require_admin),
+    dry_run: bool = Query(True),
+    limit: int = Query(200, ge=1, le=10000),
+) -> JSONResponse:
+    """
+    Normalize from public.odds_raw.payload into odds_norm.*.
+    - Dedup with DISTINCT ON (game_id, sport_key, payload_hash) picking the latest by fetched_at.
+    - Idempotent upserts with ON CONFLICT guards.
+    - dry_run=true computes counts only (no writes).
+    """
+    await _ensure_pool_open()
 
-    async with pool.connection() as conn, conn.cursor() as cur:
-        # GAMES
+    # 1) Source rows (FIXED)
+    async with pool.connection() as ac, ac.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            f"""
-            WITH src AS (
-              SELECT DISTINCT
-                (payload->>'id')::text                   AS game_uid,
-                payload->>'sport_key'                    AS sport_key,
-                (payload->>'commence_time')::timestamptz AS commence_time,
-                payload->>'away_team'                    AS away_team,
-                payload->>'home_team'                    AS home_team
-              FROM public.odds_raw
-              ORDER BY fetched_at DESC
-              {lim_clause}
-            )
-            INSERT INTO odds_norm.games (game_uid, sport_key, commence_time, away_team, home_team)
-            SELECT game_uid, sport_key, commence_time, away_team, home_team
-            FROM src
-            ON CONFLICT (game_uid) DO UPDATE
-              SET sport_key = EXCLUDED.sport_key,
-                  commence_time = EXCLUDED.commence_time,
-                  away_team = EXCLUDED.away_team,
-                  home_team = EXCLUDED.home_team
-            RETURNING 1
+            """
+            SELECT DISTINCT ON (game_id, sport_key, payload_hash)
+                id, sport_key, game_id, fetched_at, payload, payload_hash
+            FROM public.odds_raw
+            ORDER BY game_id, sport_key, payload_hash, fetched_at DESC
+            LIMIT %(limit)s
             """,
-            lim_arg,
+            {"limit": limit},
         )
-        g = len(await cur.fetchall())
+        rows: List[Dict[str, Any]] = await cur.fetchall()
 
-        # MARKETS
-        await cur.execute(
-            f"""
-            WITH src AS (
-              SELECT DISTINCT
-                (r.payload->>'id')::text AS game_uid,
-                m->>'key'                AS market_key,
-                b->>'key'                AS book_key
-              FROM public.odds_raw r
-              CROSS JOIN LATERAL jsonb_array_elements(r.payload->'bookmakers') AS b
-              CROSS JOIN LATERAL jsonb_array_elements(b->'markets')           AS m
-              ORDER BY r.fetched_at DESC
-              {lim_clause}
-            )
-            INSERT INTO odds_norm.markets (game_uid, market_key, book_key)
-            SELECT game_uid, market_key, book_key
-            FROM src
-            ON CONFLICT (game_uid, market_key, book_key) DO NOTHING
-            RETURNING 1
-            """,
-            lim_arg,
-        )
-        m = len(await cur.fetchall())
+    if not rows:
+        return JSONResponse({"ok": True, "dry_run": dry_run, "limit": limit, "source": {"rows": 0}})
 
-        # ODDS
-        await cur.execute(
-            f"""
-            WITH src AS (
-              SELECT DISTINCT
-                (r.payload->>'id')::text AS game_uid,
-                m->>'key'                AS market_key,
-                b->>'key'                AS book_key,
-                o->>'name'               AS side_raw,
-                o->>'price'              AS price_raw,
-                o->>'point'              AS point_raw,
-                COALESCE(NULLIF(b->>'last_update',''), to_char(r.fetched_at,'YYYY-MM-DD"T"HH24:MI:SSOF')) AS last_update_raw,
-                r.fetched_at             AS observed_at
-              FROM public.odds_raw r
-              CROSS JOIN LATERAL jsonb_array_elements(r.payload->'bookmakers') AS b
-              CROSS JOIN LATERAL jsonb_array_elements(b->'markets')           AS m
-              CROSS JOIN LATERAL jsonb_array_elements(m->'outcomes')          AS o
-              ORDER BY r.fetched_at DESC
-              {lim_clause}
-            )
-            INSERT INTO odds_norm.odds
-              (game_uid, market_key, book_key, side, price, point, last_update, observed_at)
-            SELECT
-              game_uid,
-              market_key,
-              book_key,
-              CASE
-                WHEN lower(side_raw) IN ('home','1','over')  THEN 'home'
-                WHEN lower(side_raw) IN ('away','2','under') THEN 'away'
-                ELSE NULL
-              END AS side,
-              CASE WHEN price_raw ~ E'^-?\\d+$'            THEN price_raw::int     ELSE NULL END AS price,
-              CASE WHEN point_raw ~ E'^-?\\d+(\\.\\d+)?$'  THEN point_raw::numeric ELSE NULL END AS point,
-              COALESCE(NULLIF(last_update_raw,'')::timestamptz, now())          AS last_update,
-              observed_at
-            FROM src
-            WHERE lower(side_raw) IN ('home','1','over','away','2','under')
-            ON CONFLICT (game_uid, market_key, book_key, side, last_update) DO NOTHING
-            RETURNING 1
-            """,
-            lim_arg,
-        )
-        o = len(await cur.fetchall())
+    ins_games = ins_markets = ins_odds = 0
 
-        if dry_run:
-            await conn.rollback()
-        else:
-            await conn.commit()
+    # 2) Normalize & upsert (or count if dry_run)
+    async with pool.connection() as ac:
+        async with ac.cursor() as cur:
+            for r in rows:
+                sport_key: str = r["sport_key"]
+                game_id_raw: str = r["game_id"]
+                payload = r["payload"]
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
 
-    return {"normalized": {"games": g, "markets": m, "odds_inserts": o}, "dry_run": bool(dry_run)}
+                gid = payload.get("id") or game_id_raw
+                home_team = (payload.get("home_team") or "").strip()
+                away_team = (payload.get("away_team") or "").strip()
+                commence_time = payload.get("commence_time")
+                game_uid = f"{sport_key}:{gid}"
 
-# mount admin
-app.include_router(admin)
+                if dry_run:
+                    ins_games += 1
+                else:
+                    await cur.execute(
+                        """
+                        INSERT INTO odds_norm.games (game_uid, sport_key, game_id, home_team, away_team, commence_time)
+                        VALUES (%(game_uid)s, %(sport_key)s, %(game_id)s, %(home_team)s, %(away_team)s, %(commence_time)s)
+                        ON CONFLICT (game_uid) DO UPDATE
+                          SET home_team = EXCLUDED.home_team,
+                              away_team = EXCLUDED.away_team,
+                              commence_time = EXCLUDED.commence_time
+                        """,
+                        {
+                            "game_uid": game_uid,
+                            "sport_key": sport_key,
+                            "game_id": gid,
+                            "home_team": home_team,
+                            "away_team": away_team,
+                            "commence_time": commence_time,
+                        },
+                    )
+
+                for bk in (payload.get("bookmakers") or []):
+                    book_key = (bk.get("key") or "").strip()
+                    book_ts = bk.get("last_update") or bk.get("lastUpdate") or payload.get("fetched_at")
+
+                    for mk in (bk.get("markets") or []):
+                        market_key = (mk.get("key") or "").strip().lower()
+                        m_ts = mk.get("last_update") or mk.get("lastUpdate") or book_ts
+
+                        if dry_run:
+                            ins_markets += 1
+                        else:
+                            await cur.execute(
+                                """
+                                INSERT INTO odds_norm.markets (game_uid, market_key, book_key, last_update)
+                                VALUES (%(game_uid)s, %(market_key)s, %(book_key)s, %(last_update)s)
+                                ON CONFLICT (game_uid, market_key, book_key) DO UPDATE
+                                  SET last_update = GREATEST(odds_norm.markets.last_update, EXCLUDED.last_update)
+                                """,
+                                {
+                                    "game_uid": game_uid,
+                                    "market_key": market_key,
+                                    "book_key": book_key,
+                                    "last_update": m_ts,
+                                },
+                            )
+
+                        for oc in (mk.get("outcomes") or []):
+                            name = oc.get("name") or ""
+                            side = _safe_market_side(market_key, name, home_team, away_team)
+                            if not side:
+                                continue
+
+                            price = oc.get("price") or oc.get("odds")
+                            point = oc.get("point")
+                            last_update = oc.get("last_update") or oc.get("lastUpdate") or m_ts
+
+                            if market_key in ("totals", "total", "over_under") and side not in ("over", "under"):
+                                continue  # satisfy CHECK constraint
+
+                            if dry_run:
+                                ins_odds += 1
+                            else:
+                                await cur.execute(
+                                    """
+                                    INSERT INTO odds_norm.odds
+                                        (game_uid, market_key, book_key, side, price, point, last_update)
+                                    VALUES
+                                        (%(game_uid)s, %(market_key)s, %(book_key)s, %(side)s, %(price)s, %(point)s, %(last_update)s)
+                                    ON CONFLICT (game_uid, market_key, book_key, side, last_update) DO NOTHING
+                                    """,
+                                    {
+                                        "game_uid": game_uid,
+                                        "market_key": market_key,
+                                        "book_key": book_key,
+                                        "side": side,
+                                        "price": price,
+                                        "point": point,
+                                        "last_update": last_update,
+                                    },
+                                )
+
+            if dry_run:
+                await ac.rollback()
+            else:
+                await ac.commit()
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "dry_run": dry_run,
+            "limit": limit,
+            "source": {"rows": len(rows)},
+            "counts": {"games": ins_games, "markets": ins_markets, "odds": ins_odds},
+        }
+    )
+
+
+# -----------------------------------------------------------------------------
+# Lifecycle & mount
+# -----------------------------------------------------------------------------
+
+@app.on_event("startup")
+async def _startup() -> None:
+    await _ensure_pool_open()
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    try:
+        await pool.close()
+    except Exception:
+        pass
+
+# Mount the admin router
+app.include_router(router)
+
+# Public root (unauthenticated)
+@app.get("/")
+async def root() -> Dict[str, Any]:
+    return {"service": "gsa-portfolio", "status": "ok"}
