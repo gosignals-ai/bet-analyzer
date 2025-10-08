@@ -49,13 +49,12 @@ async def run_retention(
 @router.post("/normalize")
 async def normalize_from_raw(
     dry_run: bool = Query(True),
-    limit: Optional[int] = Query(None, description="cap source rows"),
+    limit: Optional[int] = Query(None, description="cap odds_raw rows considered"),
     ok: bool = Depends(_auth),
 ):
     """
-    Normalize public.odds_raw (payload JSONB) → odds_norm.games/markets/odds.
-    Expected odds_raw columns: fetched_at (timestamptz), payload (jsonb), payload_hash (text), plus keys like game_id/sport_key.
-    JSON structure (Odds API): payload.bookmakers[*].key, .markets[*].key, .markets[*].last_update, .markets[*].outcomes[*]{name,price,point,last_update}
+    Normalize public.odds_raw.payload (JSONB) → odds_norm.games/markets/odds.
+    - De-duplicate per unique target key before INSERT to avoid ON CONFLICT double-update error.
     """
     if dry_run:
         return {"normalized": {"games": 0, "markets": 0, "odds_inserts": 0}, "dry_run": True}
@@ -63,14 +62,13 @@ async def normalize_from_raw(
     pool = get_pool()
     try:
         async with pool.connection() as conn, conn.cursor() as cur:
-            # Ensure schema exists (idempotent)
             await cur.execute("CREATE SCHEMA IF NOT EXISTS odds_norm")
 
-            # Build limit clause & params
+            # Bind limit param if provided
             limit_clause = " LIMIT %s" if (limit and limit > 0) else ""
             params = (limit,) if limit_clause else tuple()
 
-            # ---- GAMES ----
+            # ---- GAMES (dedup latest by game_id) ----
             games_sql = f"""
                 WITH src AS (
                   SELECT game_id, fetched_at, payload
@@ -78,16 +76,22 @@ async def normalize_from_raw(
                   WHERE game_id IS NOT NULL
                   ORDER BY fetched_at DESC
                   {limit_clause}
+                ),
+                latest AS (
+                  SELECT DISTINCT ON (game_id)
+                         game_id, fetched_at, payload
+                  FROM src
+                  ORDER BY game_id, fetched_at DESC
                 )
                 INSERT INTO odds_norm.games (game_uid, sport_key, commence_time, home_team, away_team, status)
-                SELECT DISTINCT
-                    s.game_id                                             AS game_uid,
-                    s.payload->>'sport_key'                                AS sport_key,
-                    NULLIF(s.payload->>'commence_time','')::timestamptz    AS commence_time,
-                    s.payload->>'home_team'                                AS home_team,
-                    s.payload->>'away_team'                                AS away_team,
-                    NULL                                                   AS status
-                FROM src s
+                SELECT
+                    l.game_id                                          AS game_uid,
+                    l.payload->>'sport_key'                            AS sport_key,
+                    NULLIF(l.payload->>'commence_time','')::timestamptz AS commence_time,
+                    l.payload->>'home_team'                            AS home_team,
+                    l.payload->>'away_team'                            AS away_team,
+                    NULL                                               AS status
+                FROM latest l
                 ON CONFLICT (game_uid) DO UPDATE SET
                     sport_key     = EXCLUDED.sport_key,
                     commence_time = EXCLUDED.commence_time,
@@ -99,7 +103,7 @@ async def normalize_from_raw(
             await cur.execute(games_sql, params)
             g = len(await cur.fetchall())
 
-            # ---- MARKETS ----
+            # ---- MARKETS (dedup by game_id, market_key, book_key) ----
             markets_sql = f"""
                 WITH src AS (
                   SELECT game_id, fetched_at, payload
@@ -119,10 +123,15 @@ async def normalize_from_raw(
                   CROSS JOIN LATERAL jsonb_array_elements(s.payload->'bookmakers') AS b
                   CROSS JOIN LATERAL jsonb_array_elements(b->'markets')           AS m
                   WHERE b ? 'key' AND m ? 'key'
+                ),
+                bm_dedup AS (
+                  SELECT game_id, market_key, book_key, MAX(last_update) AS last_update
+                  FROM bm
+                  GROUP BY game_id, market_key, book_key
                 )
                 INSERT INTO odds_norm.markets (game_uid, market_key, book_key, market_ref, last_update)
                 SELECT game_id, market_key, book_key, NULL, last_update
-                FROM bm
+                FROM bm_dedup
                 ON CONFLICT (game_uid, market_key, book_key) DO UPDATE
                   SET last_update = GREATEST(odds_norm.markets.last_update, EXCLUDED.last_update),
                       updated_at = now()
@@ -131,7 +140,7 @@ async def normalize_from_raw(
             await cur.execute(markets_sql, params)
             m = len(await cur.fetchall())
 
-            # ---- ODDS ----
+            # ---- ODDS (filter + dedup by full unique key) ----
             odds_sql = f"""
                 WITH src AS (
                   SELECT game_id, fetched_at, payload
@@ -153,7 +162,7 @@ async def normalize_from_raw(
                   CROSS JOIN LATERAL jsonb_array_elements(b->'markets')           AS m
                   WHERE b ? 'key' AND m ? 'key'
                 ),
-                rows AS (
+                rows_base AS (
                   SELECT
                     game_id                                   AS game_uid,
                     market_key,
@@ -165,31 +174,41 @@ async def normalize_from_raw(
                     fetched_at                                AS observed_at
                   FROM bm
                   CROSS JOIN LATERAL jsonb_array_elements(outcomes) AS o
+                ),
+                rows_flt AS (
+                  SELECT *
+                  FROM rows_base
+                  WHERE market_key IS NOT NULL
+                    AND book_key IS NOT NULL
+                    AND last_update IS NOT NULL
+                    AND price IS NOT NULL
+                    AND side_raw IN ('home','away','draw','over','under')
+                ),
+                rows_dedup AS (
+                  SELECT DISTINCT ON (game_uid, market_key, book_key, side_raw, last_update)
+                         game_uid, market_key, book_key, side_raw, price, point, last_update, observed_at
+                  FROM rows_flt
+                  ORDER BY game_uid, market_key, book_key, side_raw, last_update DESC, observed_at DESC
                 )
                 INSERT INTO odds_norm.odds
                   (game_uid, market_key, book_key, side, price, point, last_update, observed_at)
                 SELECT
-                  r.game_uid,
-                  r.market_key,
-                  r.book_key,
-                  CASE r.side_raw
+                  game_uid,
+                  market_key,
+                  book_key,
+                  CASE side_raw
                     WHEN 'home' THEN 'home'
                     WHEN 'away' THEN 'away'
                     WHEN 'draw' THEN 'draw'
                     WHEN 'over' THEN 'over'
                     WHEN 'under' THEN 'under'
-                    ELSE r.side_raw
+                    ELSE side_raw
                   END AS side,
-                  r.price,
-                  r.point,
-                  r.last_update,
-                  r.observed_at
-                FROM rows r
-                WHERE r.market_key IS NOT NULL
-                  AND r.book_key IS NOT NULL
-                  AND r.last_update IS NOT NULL
-                  AND r.price IS NOT NULL
-                  AND r.side_raw IN ('home','away','draw','over','under')
+                  price,
+                  point,
+                  last_update,
+                  observed_at
+                FROM rows_dedup
                 ON CONFLICT (game_uid, market_key, book_key, side, last_update) DO NOTHING
                 RETURNING 1
             """
@@ -199,5 +218,4 @@ async def normalize_from_raw(
         return {"normalized": {"games": g, "markets": m, "odds_inserts": o}, "dry_run": False}
 
     except Exception as e:
-        # surface message for quick diagnosis
         return {"error": "normalize_failed", "message": str(e)}
