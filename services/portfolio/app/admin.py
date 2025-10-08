@@ -1,4 +1,4 @@
-import os
+﻿import os
 from typing import Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from services.gsa_portfolio.db import get_pool
@@ -53,7 +53,7 @@ async def normalize_from_raw(
     ok: bool = Depends(_auth),
 ):
     """
-    Normalize public.odds_raw.payload (JSONB) â†’ odds_norm.games/markets/odds.
+    Normalize public.odds_raw.payload (JSONB) Ã¢â€ â€™ odds_norm.games/markets/odds.
     - De-duplicate per unique target key before INSERT to avoid ON CONFLICT double-update error.
     """
     if dry_run:
@@ -221,7 +221,7 @@ async def normalize_from_raw(
         return {"error": "normalize_failed", "message": str(e)}
 
 # --- diagnostic: normalized table counts ---
-@router.get("/admin/norm_counts")
+@router.get("/norm_counts")
 async def norm_counts(ok: bool = Depends(_auth)):
     pool = get_pool()
     async with pool.connection() as conn:
