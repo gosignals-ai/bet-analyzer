@@ -4,6 +4,7 @@ info:
   version: "1.0.0"
 servers:
   - url: https://gsa-api.gosignals-ai.workers.dev
+
 paths:
   /core/metrics:
     get:
@@ -19,6 +20,7 @@ paths:
                 properties:
                   moneyline_rows:
                     type: integer
+
   /core/latest-lines:
     get:
       operationId: coreLatestLines
@@ -55,6 +57,7 @@ paths:
                     away_book: { type: string, nullable: true }
                     home_best_price: { type: integer, nullable: true }
                     home_book: { type: string, nullable: true }
+
   /coach/summary:
     get:
       operationId: coachSummary
@@ -90,3 +93,88 @@ paths:
                         away_best: { type: string }
                         home_best: { type: string }
                         kick: { type: string }
+
+  /odds/sports/{sport}/odds:
+    get:
+      operationId: getOddsBySport
+      summary: Get odds snapshot for a sport (supports on-demand refresh)
+      parameters:
+        - name: sport
+          in: path
+          required: true
+          schema:
+            type: string
+            example: americanfootball_nfl
+        - name: fresh
+          in: query
+          required: false
+          schema:
+            type: integer
+            enum: [0, 1]
+            default: 0
+          description: "If 1, bypass cache and pull fresh data directly from Odds API."
+        - name: warm
+          in: query
+          required: false
+          schema:
+            type: integer
+            enum: [0, 1]
+            default: 0
+          description: "If 1, warm cache without forcing downstream analysis."
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  sport: { type: string }
+                  timestamp: { type: string, format: date-time }
+                  data_sources:
+                    type: array
+                    items: { type: string }
+                  odds:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        game_id: { type: string }
+                        home_team: { type: string }
+                        away_team: { type: string }
+                        home_price: { type: number }
+                        away_price: { type: number }
+
+  /__refresh:
+    post:
+      operationId: batchWarm
+      summary: Batch warm selected endpoints in the gateway cache
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                endpoints:
+                  type: array
+                  items:
+                    type: string
+                  example:
+                    - "/odds/sports/nfl/odds"
+                    - "/odds/sports/nba/odds"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  warmed:
+                    type: array
+                    items: { type: string }
+                  timestamp: { type: string, format: date-time }
+                  notes: { type: string }
